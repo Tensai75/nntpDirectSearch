@@ -4,8 +4,12 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Tensai75/nntpPool"
 )
@@ -39,7 +43,7 @@ func (ds *DirectSearch) calcMaxBoundariesScannerIterations() uint {
 	searchSpace := ds.groupLastArticle - ds.groupFirstArticle + 1
 	// Binary search worst case is log2(n)
 	maxIterations := uint(0)
-	for searchSpace > boundariesScannerStep { // The window size
+	for searchSpace > ds.config.BoundariesScannerStep { // The window size
 		searchSpace = searchSpace / 2
 		maxIterations++
 	}
@@ -76,4 +80,119 @@ func GetMD5Hash(text string) string {
 	hasher := md5.New()
 	hasher.Write([]byte(text))
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// TimeMedian returns the median time from the input slice.
+func TimeMedian(times []time.Time) time.Time {
+	if len(times) == 0 {
+		panic("cannot compute median of empty slice")
+	}
+	cpy := make([]time.Time, len(times))
+	copy(cpy, times)
+	sort.Slice(cpy, func(i, j int) bool {
+		return cpy[i].Before(cpy[j])
+	})
+	mid := len(cpy) / 2
+	if len(cpy)%2 == 1 {
+		return cpy[mid]
+	}
+	low := cpy[mid-1].UnixNano()
+	high := cpy[mid].UnixNano()
+	return time.Unix(0, (low+high)/2).UTC()
+}
+
+// stopAndDrainTimer safely stops a timer and drains its channel to prevent leaks.
+func stopAndDrainTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
+// callbackNotifier provides a non-blocking, non-dropping callback queue.
+// Producers only increment an atomic counter and send a wake-up signal.
+// A single worker drains all pending callbacks serially.
+type callbackNotifier struct {
+	ctx      context.Context
+	callback func()
+	signal   chan struct{}
+	pending  atomic.Uint64
+	wg       sync.WaitGroup
+	stopOnce sync.Once
+}
+
+// newCallbackNotifier creates and starts a callback notifier worker.
+func newCallbackNotifier(ctx context.Context, callback func()) *callbackNotifier {
+	if callback == nil {
+		callback = func() {}
+	}
+	n := &callbackNotifier{
+		ctx:      ctx,
+		callback: callback,
+		signal:   make(chan struct{}, 1),
+	}
+	n.wg.Go(func() {
+		n.worker()
+	})
+	return n
+}
+
+// Enqueue schedules one callback execution without blocking the caller.
+func (n *callbackNotifier) Enqueue() {
+	if n == nil {
+		return
+	}
+	select {
+	case <-n.ctx.Done():
+		return
+	default:
+	}
+	n.pending.Add(1)
+	select {
+	case n.signal <- struct{}{}:
+	default:
+	}
+}
+
+// Stop stops the worker and flushes pending callbacks.
+func (n *callbackNotifier) Stop() {
+	if n == nil {
+		return
+	}
+	n.stopOnce.Do(func() {
+		close(n.signal)
+		n.wg.Wait()
+	})
+}
+
+func (n *callbackNotifier) worker() {
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case _, ok := <-n.signal:
+			if !ok {
+				n.processPending()
+				return
+			}
+			n.processPending()
+		}
+	}
+}
+
+func (n *callbackNotifier) processPending() {
+	for {
+		pending := n.pending.Swap(0)
+		if pending == 0 {
+			return
+		}
+		for range pending {
+			n.callback()
+		}
+	}
 }

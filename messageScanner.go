@@ -21,6 +21,7 @@ import (
 // messageScanner holds state for concurrent overview and line scanning.
 type messageScanner struct {
 	header                 string
+	headerLower            string
 	ctx                    context.Context
 	ctxCancel              context.CancelFunc
 	firstMessage           uint
@@ -29,11 +30,11 @@ type messageScanner struct {
 	overviewScannerLimiter chan struct{}
 	linesScannerWG         sync.WaitGroup
 	linesScannerChannel    chan string
-	errorChannel           chan error
+	iterationNotifier      *callbackNotifier
 	results                map[string]map[string]nzbparser.NzbFile
 	resultsMutex           sync.Mutex
-	iterationFunc          func()
 	lastError              atomic.Value
+	reportErrorOnce        sync.Once
 	messagesRead           atomic.Uint64
 	bytesRead              atomic.Uint64
 }
@@ -63,9 +64,13 @@ func (ds *DirectSearch) MessageScanner(header string, firstMessage, lastMessage 
 	if ds.group == "" {
 		return nil, ErrNoGroupSelected
 	}
-	if firstMessage >= lastMessage {
+	if firstMessage == 0 || lastMessage == 0 || firstMessage > lastMessage {
 		return nil, ErrInvalidMessageRange
 	}
+	if !ds.messageScannerRunning.CompareAndSwap(false, true) {
+		return nil, ErrMessageScannerAlreadyRunning
+	}
+	defer ds.messageScannerRunning.Store(false)
 
 	if iterationFunc == nil {
 		iterationFunc = func() {}
@@ -74,16 +79,16 @@ func (ds *DirectSearch) MessageScanner(header string, firstMessage, lastMessage 
 	messageScannerCtx, messageScannerCtxCancel := context.WithCancel(ds.ctx)
 	ds.messageScanner = &messageScanner{
 		header:                 header,
+		headerLower:            strings.ToLower(header),
 		ctx:                    messageScannerCtx,
 		ctxCancel:              messageScannerCtxCancel,
 		firstMessage:           firstMessage,
 		lastMessage:            lastMessage,
 		overviewScannerLimiter: make(chan struct{}, 2*ds.config.Connections),
 		linesScannerChannel:    make(chan string, 10000),
-		errorChannel:           make(chan error, 1),
 		results:                make(map[string]map[string]nzbparser.NzbFile),
-		iterationFunc:          iterationFunc,
 	}
+	ds.messageScanner.iterationNotifier = newCallbackNotifier(messageScannerCtx, iterationFunc)
 
 	// start line scanners
 	ds.log("Starting line scanners")
@@ -92,9 +97,6 @@ func (ds *DirectSearch) MessageScanner(header string, firstMessage, lastMessage 
 			ds.lineScanner()
 		})
 	}
-
-	// start error handler
-	go ds.messageScannerErrorHandler()
 
 	// start overview scanners
 	ds.log("Starting message overview scanners")
@@ -120,11 +122,11 @@ func (ds *DirectSearch) MessageScanner(header string, firstMessage, lastMessage 
 	ds.messageScanner.overviewScannerWG.Wait()
 	ds.log("All message overview scanner completed")
 	close(ds.messageScanner.linesScannerChannel)
-	close(ds.messageScanner.errorChannel)
 
 	// Wait for all line scanners to complete
 	ds.messageScanner.linesScannerWG.Wait()
 	ds.log("All line scanners completed")
+	ds.messageScanner.iterationNotifier.Stop()
 
 	// Check for errors
 	err := ds.messageScanner.lastError.Load()
@@ -154,39 +156,45 @@ func (ds *DirectSearch) MessageScanner(header string, firstMessage, lastMessage 
 // overviewScanner acquires an overview reader for a message range.
 func (ds *DirectSearch) overviewScanner(first, last, restart uint) {
 	if restart > ds.config.OverviewRetries {
-		ds.messageScanner.errorChannel <- ErrOverviewReaderFailed(ds.config.OverviewRetries, first, last)
+		ds.reportMessageScannerError(ErrOverviewReaderFailed(ds.config.OverviewRetries, first, last))
 		return
 	}
 	var conn *nntpPool.NNTPConn
 	var reader *bufio.Reader
-	var err error
+	var lastErr error
 	for range ds.config.OverviewRetries {
 		c, e := ds.getConn(ds.messageScanner.ctx)
 		if e != nil {
+			lastErr = e
 			continue
 		}
 		select {
 		case <-ds.messageScanner.ctx.Done():
+			ds.pool.Put(c)
 			return
 		default:
 		}
 		r, e := c.OverviewReader(int(first), int(last))
 		if e != nil {
+			lastErr = e
 			ds.pool.Put(c)
 			continue
 		}
 		conn = c
 		reader = r
-		err = e
+		lastErr = nil
 		break
 	}
 	select {
 	case <-ds.messageScanner.ctx.Done():
+		if conn != nil {
+			ds.pool.Put(conn)
+		}
 		return
 	default:
 	}
-	if err != nil {
-		ds.messageScanner.errorChannel <- ErrRetrievingMessageOverview(first, last, err)
+	if conn == nil || reader == nil {
+		ds.reportMessageScannerError(ErrRetrievingMessageOverview(first, last, lastErr))
 		return
 	}
 
@@ -200,41 +208,80 @@ func (ds *DirectSearch) overviewScanner(first, last, restart uint) {
 
 // overviewReader streams overview lines and dispatches matching entries.
 func (ds *DirectSearch) overviewReader(conn *nntpPool.NNTPConn, reader *bufio.Reader, first, last, restart uint) {
+	type readResult struct {
+		line string
+		err  error
+	}
+	lineTimeout := time.Duration(ds.config.OverviewTimeout) * time.Second
+	resultChan := make(chan readResult, 1)
+	done := make(chan struct{})
+	timer := time.NewTimer(lineTimeout)
+	stopAndDrainTimer(timer)
+	defer stopAndDrainTimer(timer)
+
+	go func(r *bufio.Reader, out chan<- readResult, stop <-chan struct{}) {
+		defer close(out)
+		for {
+			line, err := r.ReadString('\n')
+			ds.messageScanner.bytesRead.Add(uint64(len(line)))
+			trimmedLine := strings.TrimSpace(line)
+			select {
+			case <-stop:
+				return
+			case out <- readResult{line: trimmedLine, err: err}:
+			}
+			// Important: terminate the reader goroutine on NNTP terminator/empty line
+			// so the natural return path below can safely reuse the connection without
+			// leaving a blocked ReadString running in the background.
+			if err != nil || trimmedLine == "." || trimmedLine == "" {
+				return
+			}
+		}
+	}(reader, resultChan, done)
+	defer close(done)
+
 	for i := uint(1); ; i++ {
 		select {
 		case <-ds.messageScanner.ctx.Done():
+			conn.Close()
 			ds.pool.Put(conn)
 			return
 		default:
 		}
-		lineChan := make(chan string, 1)
-		errorChan := make(chan error, 1)
-		go func(r *bufio.Reader) {
-			line, err := r.ReadString('\n')
-			ds.messageScanner.bytesRead.Add(uint64(len(line)))
-			if err != nil {
-				errorChan <- err
-				lineChan <- ""
-			} else {
-				lineChan <- strings.TrimSpace(line)
-			}
-		}(reader)
+		timer.Reset(lineTimeout)
 		select {
 		case <-ds.messageScanner.ctx.Done():
+			stopAndDrainTimer(timer)
+			conn.Close()
 			ds.pool.Put(conn)
 			return
-		case line := <-lineChan:
-			if line == "." || line == "" {
+		case result, ok := <-resultChan:
+			stopAndDrainTimer(timer)
+			if !ok {
+				conn.Close()
 				ds.pool.Put(conn)
 				return
 			}
-			if strings.Contains(strings.ToLower(line), strings.ToLower(ds.messageScanner.header)) {
-				ds.messageScanner.linesScannerChannel <- line
+			if result.err != nil {
+				ds.log(fmt.Sprintf("Overview reader error at line %d for range %d - %d: %v", i, first, last, result.err))
+				ds.maybeRestartOverviewScanner(i, first, last, restart)
+				conn.Close()
+				ds.pool.Put(conn)
+				return
+			}
+			if result.line == "." || result.line == "" {
+				// Safe to reuse without Close because the reader goroutine above
+				// self-terminates when it reads "." or "".
+				ds.pool.Put(conn)
+				return
+			}
+			if strings.Contains(strings.ToLower(result.line), ds.messageScanner.headerLower) {
+				ds.messageScanner.linesScannerChannel <- result.line
 			} else {
 				ds.messageScanner.messagesRead.Add(1)
-				go ds.messageScanner.iterationFunc()
+				ds.messageScanner.iterationNotifier.Enqueue()
 			}
-		case <-time.After(time.Duration(ds.config.OverviewTimeout) * time.Second):
+		case <-timer.C:
 			conn.Close()
 			ds.pool.Put(conn)
 			ds.log(fmt.Sprintf("Overview reader timeout at line %d for range %d - %d", i, first, last))
@@ -286,13 +333,14 @@ func (ds *DirectSearch) lineScanner() {
 				continue
 			}
 			subject := html.UnescapeString(strings.ToValidUTF8(overview.Subject, ""))
-			if strings.Contains(strings.ToLower(subject), strings.ToLower(ds.messageScanner.header)) {
+			if strings.Contains(strings.ToLower(subject), ds.messageScanner.headerLower) {
 				if subject, err := subjectparser.Parse(subject); err == nil {
 					var date int64
 					if date = overview.Date.Unix(); date < 0 {
 						date = 0
 					}
 					poster := strings.ToValidUTF8(overview.From, "")
+					escapedGroup := html.EscapeString(ds.group)
 					// make hashes
 					headerHash := GetMD5Hash(subject.Header + poster + strconv.Itoa(subject.TotalFiles))
 					fileHash := GetMD5Hash(headerHash + subject.Filename + strconv.Itoa(subject.File) + strconv.Itoa(subject.TotalSegments))
@@ -302,7 +350,7 @@ func (ds *DirectSearch) lineScanner() {
 					}
 					if _, ok := ds.messageScanner.results[headerHash][fileHash]; !ok {
 						ds.messageScanner.results[headerHash][fileHash] = nzbparser.NzbFile{
-							Groups:       []string{ds.group},
+							Groups:       []string{escapedGroup},
 							Subject:      subject.Subject,
 							Poster:       poster,
 							Number:       subject.File,
@@ -311,8 +359,8 @@ func (ds *DirectSearch) lineScanner() {
 						}
 					}
 					file := ds.messageScanner.results[headerHash][fileHash]
-					if file.Groups[len(file.Groups)-1] != ds.group {
-						file.Groups = append(file.Groups, html.EscapeString(ds.group))
+					if file.Groups[len(file.Groups)-1] != escapedGroup {
+						file.Groups = append(file.Groups, escapedGroup)
 					}
 					if subject.Segment == 1 {
 						file.Subject = subject.Subject
@@ -330,24 +378,18 @@ func (ds *DirectSearch) lineScanner() {
 				}
 			}
 			ds.messageScanner.messagesRead.Add(1)
-			go ds.messageScanner.iterationFunc()
+			ds.messageScanner.iterationNotifier.Enqueue()
 		}
 	}
 }
 
-// messageScannerErrorHandler captures the first scanner error.
-func (ds *DirectSearch) messageScannerErrorHandler() {
-	for {
-		select {
-		case <-ds.messageScanner.ctx.Done():
-			return
-		case err, ok := <-ds.messageScanner.errorChannel:
-			if !ok {
-				return
-			}
-			ds.messageScanner.lastError.Store(err)
-			//ds.messageScanner.ctxCancel()
-			return
-		}
+// reportMessageScannerError sets the first error encountered and cancels the scanner context.
+func (ds *DirectSearch) reportMessageScannerError(err error) {
+	if err == nil || ds.messageScanner == nil {
+		return
 	}
+	ds.messageScanner.reportErrorOnce.Do(func() {
+		ds.messageScanner.lastError.Store(err)
+		ds.messageScanner.ctxCancel()
+	})
 }

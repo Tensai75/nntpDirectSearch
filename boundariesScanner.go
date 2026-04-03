@@ -19,7 +19,7 @@ type boundariesScanner struct {
 	endDate             time.Time
 	firstMessageChannel chan boundariesScannerResult
 	lastMessageChannel  chan boundariesScannerResult
-	iterationFunc       func()
+	iterationNotifier   *callbackNotifier
 }
 
 // boundariesScannerResult captures a boundary scan result or error.
@@ -42,22 +42,36 @@ type BoundariesScannerResultMessage struct {
 	Date      time.Time
 }
 
-// boundariesScannerStep is the overview window size used by the boundary scan.
-const boundariesScannerStep = uint(1000)
+// boundarySearch holds state for a single boundary search operation.
+type boundarySearch struct {
+	low           uint
+	high          uint
+	overviewStart uint
+	overviewEnd   uint
+	lastStep      bool
+	forFirst      bool
+	direction     string
+	target        string
+	targetDate    time.Time
+	noResultError error
+	lastDate      time.Time
+}
 
 var (
 	// ErrUnknownError indicates an unexpected internal failure.
 	ErrUnknownError = fmt.Errorf("unknown error")
+	// ErrUnexpectedError indicates an unexpected error that should be reported to the developer
+	ErrUnexpectedError = fmt.Errorf("unexpected error - please report this error on https://github.com/Tensai75/nzb-monkey-go/issues")
 	// ErrInvalidDateRange indicates the start date is after the end date.
 	ErrInvalidDateRange = fmt.Errorf("invalid search date range")
-	// ErrOldestMessageNewerThanEndDate indicates the group's oldest message is newer than the end date.
-	ErrOldestMessageNewerThanEndDate = fmt.Errorf("the oldest message in the group is newer than the specified end date")
-	// ErrNewestMessageOlderThanStartDate indicates the group's newest message is older than the start date.
-	ErrNewestMessageOlderThanStartDate = fmt.Errorf("the newest message in the group is older than the specified start date")
-	// ErrNoMessageFoundAfterStartDate indicates no message exists on or after the start date.
-	ErrNoMessageFoundAfterStartDate = fmt.Errorf("no messages found on or after the specified start date")
-	// ErrNoMessageFoundBeforeEndDate indicates no message exists on or before the end date.
-	ErrNoMessageFoundBeforeEndDate = fmt.Errorf("no messages found on or before the specified end date")
+	// ErrFirstMessageInGroupIsAfterEndDate indicates that the date of the first message in the group is after the end date.
+	ErrFirstMessageInGroupIsAfterEndDate = fmt.Errorf("the date of the first message in the group is after the specified end date")
+	// ErrLastMessageInGroupIsBeforeStartDate indicates that the date of the last message in the group is before the start date.
+	ErrLastMessageInGroupIsBeforeStartDate = fmt.Errorf("the date of the last message in the group is before the specified start date")
+	// ErrNoMessageFoundAfterStartDate indicates no message exists after the start date.
+	ErrNoMessageFoundAfterStartDate = fmt.Errorf("no messages found after the specified start date")
+	// ErrNoMessageFoundBeforeEndDate indicates no message exists before the end date.
+	ErrNoMessageFoundBeforeEndDate = fmt.Errorf("no messages found before the specified end date")
 	// ErrNoMessagesFoundWithinRange indicates no messages were found within the search range.
 	ErrNoMessagesFoundWithinRange = fmt.Errorf("no messages found within search range")
 	// ErrAllRequestsTimedOut indicates all overview requests exceeded the timeout.
@@ -85,6 +99,10 @@ func (ds *DirectSearch) BoundariesScanner(startDate, endDate time.Time, iteratio
 	if startDate.After(endDate) {
 		return BoundariesScannerResult{}, ErrInvalidDateRange
 	}
+	if !ds.boundariesScannerRunning.CompareAndSwap(false, true) {
+		return BoundariesScannerResult{}, ErrBoundariesScannerAlreadyRunning
+	}
+	defer ds.boundariesScannerRunning.Store(false)
 
 	if iterationFunc == nil {
 		iterationFunc = func() {}
@@ -100,17 +118,83 @@ func (ds *DirectSearch) BoundariesScanner(startDate, endDate time.Time, iteratio
 		endDate:             endDate,
 		firstMessageChannel: make(chan boundariesScannerResult, 1),
 		lastMessageChannel:  make(chan boundariesScannerResult, 1),
-		iterationFunc:       iterationFunc,
 	}
+	ds.boundariesScanner.iterationNotifier = newCallbackNotifier(boundariesCtx, iterationFunc)
+	defer ds.boundariesScanner.iterationNotifier.Stop()
 
 	// Start scanning for first and last message in parallel
 	ds.log("Starting boundaries scanning")
-	go ds.getFirstMessageNumber()
-	go ds.getLastMessageNumber()
+	ds.log(fmt.Sprintf("Boundaries Scanner Step size: %d", ds.config.BoundariesScannerStep))
+	ds.log(fmt.Sprintf("Boundaries Scanner Tolerance: %d seconds", ds.config.BoundariesScannerTolerance))
 
-	// Wait for message scan to complete
-	firstMessageResult := <-ds.boundariesScanner.firstMessageChannel
-	lastMessageResult := <-ds.boundariesScanner.lastMessageChannel
+	// Get mean dates for the first messages
+	firstProbeEnd := ds.groupLastArticle
+	if ds.config.BoundariesScannerStep < (ds.groupLastArticle - ds.groupFirstArticle) {
+		firstProbeEnd = ds.groupFirstArticle + ds.config.BoundariesScannerStep
+	}
+	firstMessages, err := ds.overview(ds.groupFirstArticle, firstProbeEnd)
+	if err != nil {
+		return BoundariesScannerResult{}, err
+	}
+	if len(firstMessages) == 0 {
+		return BoundariesScannerResult{}, ErrNoMessagesFoundWithinRange
+	}
+	firstMessagesDates := make([]time.Time, len(firstMessages))
+	for i := range firstMessages {
+		firstMessagesDates[i] = firstMessages[i].Date
+	}
+	meanFirstMessagesDate := TimeMedian(firstMessagesDates)
+	ds.boundariesScanner.iterationNotifier.Enqueue()
+
+	// Get mean dates for the last messages
+	lastProbeStart := ds.groupFirstArticle
+	if ds.groupLastArticle > ds.config.BoundariesScannerStep {
+		lastProbeStart = ds.groupLastArticle - ds.config.BoundariesScannerStep
+	}
+	lastMessages, err := ds.overview(lastProbeStart, ds.groupLastArticle)
+	if err != nil {
+		return BoundariesScannerResult{}, err
+	}
+	if len(lastMessages) == 0 {
+		return BoundariesScannerResult{}, ErrNoMessagesFoundWithinRange
+	}
+	lastMessagesDates := make([]time.Time, len(lastMessages))
+	for i := range lastMessages {
+		lastMessagesDates[i] = lastMessages[i].Date
+	}
+	meanLastMessagesDate := TimeMedian(lastMessagesDates)
+	ds.boundariesScanner.iterationNotifier.Enqueue()
+
+	// Check if the date of the last message in the group is before the start date
+	if meanLastMessagesDate.Before(ds.boundariesScanner.startDate) {
+		ds.log("Mean date of last messages is before start date")
+		return BoundariesScannerResult{}, ErrLastMessageInGroupIsBeforeStartDate
+	}
+	// Check if the date of the first message in the group is after the end date
+	if meanFirstMessagesDate.After(ds.boundariesScanner.endDate) {
+		ds.log("Mean date of first messages is after end date")
+		return BoundariesScannerResult{}, ErrFirstMessageInGroupIsAfterEndDate
+	}
+	go ds.getFirstMessageNumber(meanFirstMessagesDate)
+	go ds.getLastMessageNumber(meanLastMessagesDate)
+
+	// Wait for message scans to complete (cancellation-aware)
+	var firstMessageResult boundariesScannerResult
+	var lastMessageResult boundariesScannerResult
+	gotFirst := false
+	gotLast := false
+	for !gotFirst || !gotLast {
+		select {
+		case <-boundariesCtx.Done():
+			return BoundariesScannerResult{}, boundariesCtx.Err()
+		case result := <-ds.boundariesScanner.firstMessageChannel:
+			firstMessageResult = result
+			gotFirst = true
+		case result := <-ds.boundariesScanner.lastMessageChannel:
+			lastMessageResult = result
+			gotLast = true
+		}
+	}
 	ds.log("Boundaries scanning completed")
 
 	// Close channels
@@ -156,7 +240,16 @@ func (ds *DirectSearch) BoundariesScanner(startDate, endDate time.Time, iteratio
 }
 
 // getFirstMessageNumber finds the first message at or after the start date.
-func (ds *DirectSearch) getFirstMessageNumber() {
+func (ds *DirectSearch) getFirstMessageNumber(meanFirstMessagesDate time.Time) {
+
+	// Check if the start date is before the first message in the group
+	if ds.boundariesScanner.startDate.Before(meanFirstMessagesDate) {
+		ds.log("Start date is before mean date of first articles in group, setting first message number to first article in group")
+		ds.boundariesScanner.firstMessageChannel <- boundariesScannerResult{ds.groupFirstArticle, meanFirstMessagesDate, nil}
+		return
+	}
+
+	// Perform binary search for the first message
 	result := ds.findMessageByDate(true)
 
 	// Check for context cancellation
@@ -166,19 +259,20 @@ func (ds *DirectSearch) getFirstMessageNumber() {
 	default:
 	}
 
-	if result.err != nil {
-		ds.boundariesScanner.firstMessageChannel <- boundariesScannerResult{0, time.Time{}, result.err}
-		return
-	}
-	if result.date.After(ds.boundariesScanner.endDate) {
-		ds.boundariesScanner.firstMessageChannel <- boundariesScannerResult{0, time.Time{}, ErrOldestMessageNewerThanEndDate}
-		return
-	}
 	ds.boundariesScanner.firstMessageChannel <- result
 }
 
 // getLastMessageNumber finds the last message at or before the end date.
-func (ds *DirectSearch) getLastMessageNumber() {
+func (ds *DirectSearch) getLastMessageNumber(meanLastMessagesDate time.Time) {
+
+	// Check if the end date is after the last message in the group
+	if ds.boundariesScanner.endDate.After(meanLastMessagesDate) {
+		ds.log("End date is after mean date of last articles in group, setting last message number to last article in group")
+		ds.boundariesScanner.lastMessageChannel <- boundariesScannerResult{ds.groupLastArticle, meanLastMessagesDate, nil}
+		return
+	}
+
+	// Perform binary search for the last message
 	result := ds.findMessageByDate(false)
 
 	// Check for context cancellation
@@ -188,45 +282,36 @@ func (ds *DirectSearch) getLastMessageNumber() {
 	default:
 	}
 
-	if result.err != nil {
-		ds.boundariesScanner.lastMessageChannel <- boundariesScannerResult{0, time.Time{}, result.err}
-		return
-	}
-	if result.date.Before(ds.boundariesScanner.startDate) {
-		ds.boundariesScanner.lastMessageChannel <- boundariesScannerResult{0, time.Time{}, ErrNewestMessageOlderThanStartDate}
-		return
-	}
 	ds.boundariesScanner.lastMessageChannel <- result
 }
 
 // findMessageByDate performs a binary search for a boundary message by date.
 func (ds *DirectSearch) findMessageByDate(searchForFirst bool) boundariesScannerResult {
 
-	low := ds.groupFirstArticle
-	high := ds.groupLastArticle
-
-	var direction string
-	var targetDate time.Time
-	var noResultError error
-	var boundariesError error
+	var search boundarySearch
 
 	if searchForFirst {
-		direction = "up"
-		targetDate = ds.boundariesScanner.startDate
-		noResultError = ErrNoMessageFoundAfterStartDate
-		boundariesError = ErrNewestMessageOlderThanStartDate
+		search.forFirst = true
+		search.direction = "up"
+		search.target = "first"
+		search.targetDate = ds.boundariesScanner.startDate
+		search.noResultError = ErrNoMessageFoundAfterStartDate
 	} else {
-		direction = "down"
-		targetDate = ds.boundariesScanner.endDate
-		noResultError = ErrNoMessageFoundBeforeEndDate
-		boundariesError = ErrOldestMessageNewerThanEndDate
+		search.forFirst = false
+		search.direction = "down"
+		search.target = "last"
+		search.targetDate = ds.boundariesScanner.endDate
+		search.noResultError = ErrNoMessageFoundBeforeEndDate
 	}
 
-	var lastStep = false
-	var lastResult boundariesScannerResult
+	search.low = ds.groupFirstArticle
+	search.high = ds.groupLastArticle
+	search.lastStep = false
 
 	// Binary search for the target message
-	for low <= high {
+	step := 0
+	for search.low < search.high {
+		step++
 
 		// Check for context cancellation
 		select {
@@ -236,162 +321,150 @@ func (ds *DirectSearch) findMessageByDate(searchForFirst bool) boundariesScanner
 		}
 
 		// Ensure boundaries are within valid message range
-		if low < ds.groupFirstArticle {
-			low = ds.groupFirstArticle
+		if search.low < ds.groupFirstArticle {
+			search.low = ds.groupFirstArticle
 		}
-		if high > ds.groupLastArticle {
-			high = ds.groupLastArticle
+		if search.high > ds.groupLastArticle {
+			search.high = ds.groupLastArticle
 		}
-		if low > high {
+		if search.low > search.high {
 			break
 		}
 
 		// Calculate the mid point
-		mid := low + (high-low)/2
+		mid := search.low + (search.high-search.low)/2
 
 		// Calculate the overview range as +/- overviewStep/2 around mid
-		overviewStart := mid - (boundariesScannerStep / 2)
-		overviewEnd := mid + (boundariesScannerStep / 2)
+		search.overviewStart = mid - (ds.config.BoundariesScannerStep / 2)
+		search.overviewEnd = mid + (ds.config.BoundariesScannerStep / 2)
 
 		// Ensure overviewStart and overviewEnd are within boundaries
-		if overviewStart <= low {
-			overviewStart = low
-			lastStep = true
+		if search.overviewStart <= search.low {
+			search.overviewStart = search.low
+			search.lastStep = true
 		}
-		if overviewEnd >= high {
-			overviewEnd = high
-			lastStep = true
+		if search.overviewEnd >= search.high {
+			search.overviewEnd = search.high
+			search.lastStep = true
 		}
 
-		// Request overview for the calculated range
-		results := []nntp.MessageOverview{}
-		var err error
-		for range ds.config.OverviewRetries {
-
-			// Check for context cancellation before each retry
-			select {
-			case <-ds.boundariesScanner.ctx.Done():
-				return boundariesScannerResult{0, time.Time{}, ds.boundariesScanner.ctx.Err()}
-			default:
-			}
-
-			results, err = ds.boundariesScannerOverview(overviewStart, overviewEnd)
-			if err == nil {
-				break
-			}
-		}
+		// Get overview for the calculated range with retries
+		results, err := ds.overview(search.overviewStart, search.overviewEnd)
 		if err != nil {
-			return boundariesScannerResult{0, time.Time{}, ErrRequestFailed(ds.config.OverviewRetries, overviewStart, overviewEnd, err)}
+			return boundariesScannerResult{0, time.Time{}, err}
 		}
 
 		// Handle empty results - messages might be deleted in this range
 		if len(results) == 0 {
-			// No messages available in this range
-			// If this was the last step, we can't go further
-			if lastStep {
-				if (searchForFirst && overviewEnd == high) || (!searchForFirst && overviewStart == low) {
-					return boundariesScannerResult{0, time.Time{}, boundariesError}
-				} else {
-					if lastResult != (boundariesScannerResult{}) {
-						return lastResult
-					} else {
-						return boundariesScannerResult{0, time.Time{}, noResultError}
-					}
+			// If this is the last step, we cant go further, return result based on overview range and last date
+			if search.lastStep {
+				ds.log(fmt.Sprintf("Last step reached for %s message search but no messages found, returning result", search.target))
+				message := uint(search.overviewEnd)
+				if search.forFirst {
+					message = uint(search.overviewStart)
 				}
+				return boundariesScannerResult{message, search.lastDate, nil}
 			}
 			// Update search bounds based on direction
-			if direction == "up" {
-				low = overviewEnd + 1
+			if search.direction == "up" {
+				search.low = search.overviewEnd + 1
 			} else {
-				high = overviewStart - 1
+				search.high = search.overviewStart - 1
 			}
-			go ds.boundariesScanner.iterationFunc()
+			ds.boundariesScanner.iterationNotifier.Enqueue()
 			continue
 		}
 
-		// Save appropriate result for potential use in last step
-		if searchForFirst {
-			lastResult = boundariesScannerResult{
-				messageID: uint(results[0].MessageNumber),
-				date:      results[0].Date,
-				err:       nil,
-			}
-		} else {
-			lastResult = boundariesScannerResult{
-				messageID: uint(results[len(results)-1].MessageNumber),
-				date:      results[len(results)-1].Date,
-				err:       nil,
-			}
+		// Calculate mean date of the overview results
+		dates := make([]time.Time, len(results))
+		for i := range results {
+			dates[i] = results[i].Date
 		}
+		meanDate := TimeMedian(dates)
 
-		// If this is the last step, scan the results directly
-		if lastStep {
-			result, found := scanResultsForTarget(results, targetDate, searchForFirst)
-			if found {
-				return boundariesScannerResult{uint(result.MessageNumber), result.Date, nil}
-			}
-
-			if (searchForFirst && overviewEnd == high) || (!searchForFirst && overviewStart == low) {
-				return boundariesScannerResult{0, time.Time{}, boundariesError}
-			} else {
-				if searchForFirst {
-					return boundariesScannerResult{uint(results[0].MessageNumber), results[0].Date, nil}
-				} else {
-					return boundariesScannerResult{uint(results[len(results)-1].MessageNumber), results[len(results)-1].Date, nil}
-				}
-			}
-		}
-
-		// Check only first and last message to determine search direction
+		// Get first and last message
 		firstResult := results[0]
 		lastResult := results[len(results)-1]
 
+		// If this is the last step, return result
+		if search.lastStep {
+			ds.log(fmt.Sprintf("Last step reached for %s message search, returning result", search.target))
+			if search.forFirst {
+				return boundariesScannerResult{uint(firstResult.MessageNumber), meanDate, nil}
+			} else {
+				return boundariesScannerResult{uint(lastResult.MessageNumber), meanDate, nil}
+			}
+		}
+
+		// Check if the mean date is close enough to the target date to return result
+		if (search.forFirst && (search.targetDate.Before(meanDate) && search.targetDate.After(meanDate.Add(-time.Duration(ds.config.BoundariesScannerTolerance)*time.Second)))) ||
+			(!search.forFirst && (search.targetDate.After(meanDate) && search.targetDate.Before(meanDate.Add(time.Duration(ds.config.BoundariesScannerTolerance)*time.Second)))) {
+			ds.log(fmt.Sprintf("Target date %s is close to mean date %s for %s message search, returning result", search.targetDate.Format(time.RFC850), meanDate.Format(time.RFC850), search.target))
+			if search.forFirst {
+				return boundariesScannerResult{uint(firstResult.MessageNumber), meanDate, nil}
+			} else {
+				return boundariesScannerResult{uint(lastResult.MessageNumber), meanDate, nil}
+			}
+		}
+
+		// Save last date for further use in case of empty results in next iteration
+		search.lastDate = meanDate
+
 		// Update search bounds based on comparison with target date
-		if searchForFirst {
-			if targetDate.Before(firstResult.Date) {
-				high = uint(firstResult.MessageNumber) - 1
-				direction = "down"
-				go ds.boundariesScanner.iterationFunc()
+		if search.forFirst {
+			if search.targetDate.Before(meanDate) {
+				search.high = uint(firstResult.MessageNumber) - 1
+				search.direction = "down"
+				ds.boundariesScanner.iterationNotifier.Enqueue()
 				continue
 			}
-			if targetDate.After(lastResult.Date) {
-				low = uint(lastResult.MessageNumber) + 1
-				direction = "up"
-				go ds.boundariesScanner.iterationFunc()
+			if search.targetDate.After(meanDate) {
+				search.low = uint(lastResult.MessageNumber) + 1
+				search.direction = "up"
+				ds.boundariesScanner.iterationNotifier.Enqueue()
 				continue
 			}
 		} else {
-			if targetDate.After(lastResult.Date) {
-				low = uint(lastResult.MessageNumber) + 1
-				direction = "up"
-				go ds.boundariesScanner.iterationFunc()
+			if search.targetDate.After(meanDate) {
+				search.low = uint(lastResult.MessageNumber) + 1
+				search.direction = "up"
+				ds.boundariesScanner.iterationNotifier.Enqueue()
 				continue
 			}
-			if targetDate.Before(firstResult.Date) {
-				high = uint(firstResult.MessageNumber) - 1
-				direction = "down"
-				go ds.boundariesScanner.iterationFunc()
+			if search.targetDate.Before(meanDate) {
+				search.high = uint(firstResult.MessageNumber) - 1
+				search.direction = "down"
+				ds.boundariesScanner.iterationNotifier.Enqueue()
 				continue
 			}
 		}
 
-		// Target date is between first and last message - scan the range directly
-		result, found := scanResultsForTarget(results, targetDate, searchForFirst)
-		if found {
-			return boundariesScannerResult{uint(result.MessageNumber), result.Date, nil}
-		}
-
-		// Fallback - continue search
-		ds.log(fmt.Sprintf("Unexpected condition encountered: direction %s / low %d / high %d", direction, low, high))
-		if direction == "up" {
-			low = overviewEnd + 1
-		} else {
-			high = overviewStart - 1
-		}
-		go ds.boundariesScanner.iterationFunc()
+		// This should not be reachable, but if it does, log and return an error
+		ds.log(fmt.Sprintf("Unexpected error in binary search for %s message: target date %s, mean date %s, first message date %s, last message date %s", search.target, search.targetDate.Format(time.RFC850), meanDate.Format(time.RFC850), firstResult.Date.Format(time.RFC850), lastResult.Date.Format(time.RFC850)))
+		return boundariesScannerResult{0, time.Time{}, ErrUnexpectedError}
 	}
 
-	return boundariesScannerResult{0, time.Time{}, noResultError}
+	return boundariesScannerResult{0, time.Time{}, search.noResultError}
+}
+
+// overview fetches message overviews for the given range with retries and context cancellation support.
+func (ds *DirectSearch) overview(overviewStart, overviewEnd uint) (results []nntp.MessageOverview, err error) {
+	for range ds.config.OverviewRetries {
+		// Check for context cancellation before each retry
+		select {
+		case <-ds.boundariesScanner.ctx.Done():
+			return nil, ds.boundariesScanner.ctx.Err()
+		default:
+		}
+		results, err = ds.boundariesScannerOverview(overviewStart, overviewEnd)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, ErrRequestFailed(ds.config.OverviewRetries, overviewStart, overviewEnd, err)
+	}
+	return results, nil
 }
 
 // boundariesScannerOverview fetches message overviews for the given range.
@@ -402,31 +475,32 @@ func (ds *DirectSearch) boundariesScannerOverview(begin, end uint) ([]nntp.Messa
 	var lastError atomic.Value
 	conns := make([]*nntpPool.NNTPConn, ds.config.OverviewRetries)
 	for i := range ds.config.OverviewRetries {
+		idx := i
 		overviews.Go(func() {
 			var err error
-			conns[i], err = ds.getConn(ctx)
+			conns[idx], err = ds.getConn(ctx)
 			if err != nil {
 				select {
 				case <-ctx.Done():
 					return
 				default:
-					lastError.Store(err)
+					lastError.Store(err.Error())
 					return
 				}
 			}
-			defer ds.pool.Put(conns[i])
+			defer ds.pool.Put(conns[idx])
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			messages, err := conns[i].Overview(int(begin), int(end))
+			messages, err := conns[idx].Overview(int(begin), int(end))
 			if err != nil {
 				select {
 				case <-ctx.Done():
 					return
 				default:
-					lastError.Store(err)
+					lastError.Store(err.Error())
 					return
 				}
 			}
@@ -446,9 +520,12 @@ func (ds *DirectSearch) boundariesScannerOverview(begin, end uint) ([]nntp.Messa
 	case messageOverview, ok := <-messagesChannel:
 		cancel()
 		if !ok {
-			err := lastError.Load().(error)
-			if err == nil {
+			var err error
+			loadedError := lastError.Load()
+			if loadedError == nil {
 				err = ErrUnknownError
+			} else {
+				err = fmt.Errorf("%v", loadedError)
 			}
 			ds.log(fmt.Sprintf("All overview requests failed for range %d - %d: %v", begin, end, err))
 			return nil, ErrAllRequestsFailed(err)
@@ -464,25 +541,4 @@ func (ds *DirectSearch) boundariesScannerOverview(begin, end uint) ([]nntp.Messa
 		ds.log(fmt.Sprintf("All overview requests timed out for range %d - %d", begin, end))
 		return nil, ErrAllRequestsTimedOut
 	}
-}
-
-// scanResultsForTarget scans a result set for the closest target date match.
-func scanResultsForTarget(results []nntp.MessageOverview, targetDate time.Time, searchForFirst bool) (nntp.MessageOverview, bool) {
-	if searchForFirst {
-		// Scan forward for first message >= targetDate
-		for _, result := range results {
-			if !result.Date.Before(targetDate) {
-				return result, true
-			}
-		}
-	} else {
-		// Scan backward for last message <= targetDate
-		for i := len(results) - 1; i >= 0; i-- {
-			result := results[i]
-			if !result.Date.After(targetDate) {
-				return result, true
-			}
-		}
-	}
-	return nntp.MessageOverview{}, false
 }

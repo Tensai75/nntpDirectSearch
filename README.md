@@ -6,7 +6,7 @@ A high-performance Go library for efficient NNTP (Network News Transfer Protocol
 
 - **Concurrent Message Scanning**: Uses multiple concurrent workers to efficiently scan large NNTP groups
 - **Connection Pooling**: Manages a shared pool of NNTP connections for optimal resource utilization
-- **Date-Based Boundary Detection**: Find the first and last messages within a specific date range using binary search
+- **Date-Based Boundary Detection**: Find the first and last messages within a specific date range using binary search over overview windows
 - **NZB FIle Generation**: Build NZB files from message subject parsing and matching
 - **Progress Tracking**: Built-in metrics for monitoring lines read and bytes processed
 - **Configurable Timeouts & Retries**: Tune overview request timeouts and retry strategies
@@ -22,6 +22,7 @@ go get github.com/Tensai75/nntpDirectSearch
 ## Dependencies
 
 This library requires:
+
 - `github.com/Tensai75/nntpPool` - NNTP connection pooling
 - `github.com/Tensai75/nntp` - NNTP protocol implementation
 - `github.com/Tensai75/nzbparser` - NZB file parsing and generation
@@ -46,7 +47,7 @@ import (
 func main() {
 	// Create a connection pool
 	pool := nntpPool.NewPool("news.server.com:119", 10, time.Minute)
-	
+
 	// Create a DirectSearch instance
 	ds, err := nntpDirectSearch.New(pool, context.Background())
 	if err != nil {
@@ -55,10 +56,12 @@ func main() {
 
 	// Optionally configure scanning behavior
 	config := nntpDirectSearch.DirectSearchConfig{
-		Connections:     20,    // Number of concurrent connections
-		Step:            20000, // Message range step size
-		OverviewTimeout: 5,     // Timeout in seconds
-		OverviewRetries: 3,     // Number of retries
+		Connections:                20,    // Number of concurrent connections
+		Step:                       20000, // MessageScanner range step size
+		OverviewTimeout:            5,     // Timeout in seconds
+		OverviewRetries:            3,     // Number of retries
+		BoundariesScannerStep:      1000,  // Overview window size used by BoundariesScanner
+		BoundariesScannerTolerance: 15,    // Date tolerance in seconds for boundary convergence
 	}
 	if err := ds.SetConfig(config); err != nil {
 		log.Fatal(err)
@@ -75,7 +78,7 @@ func main() {
 			log.Println("[DEBUG]", msg)
 		}
 	}()
-	
+
 	// Use the scanners...
 }
 ```
@@ -84,6 +87,10 @@ func main() {
 
 Use `BoundariesScanner` to locate the first and last messages within a specific date range:
 
+`BoundariesScanner` does not compare only single-message timestamps. It fetches overview windows and uses the **median timestamp** of each window as the representative "average" date while converging on first/last boundaries.
+
+Using a median over a window is more robust than using a single article date, because occasional outlier timestamps do not significantly skew the boundary decision.
+
 ```go
 startDate := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 endDate := time.Date(2024, 1, 31, 23, 59, 59, 0, time.UTC)
@@ -91,8 +98,8 @@ endDate := time.Date(2024, 1, 31, 23, 59, 59, 0, time.UTC)
 // Progress callback (optional)
 iteration := 0
 progressFunc := func() {
-	log.Printf("Progress: %d/%d iterations\n", 
-		iteration++, 
+	log.Printf("Progress: %d/%d iterations\n",
+		iteration++,
 		ds.MaxBoundariesScannerIterations)
 }
 
@@ -101,11 +108,11 @@ if err != nil {
 	log.Fatal(err)
 }
 
-log.Printf("First message: ID=%d, Date=%v\n", 
-	result.FirstMessage.MessageID, 
+log.Printf("First message: ID=%d, Date=%v\n",
+	result.FirstMessage.MessageID,
 	result.FirstMessage.Date)
-log.Printf("Last message: ID=%d, Date=%v\n", 
-	result.LastMessage.MessageID, 
+log.Printf("Last message: ID=%d, Date=%v\n",
+	result.LastMessage.MessageID,
 	result.LastMessage.Date)
 ```
 
@@ -138,10 +145,12 @@ The `DirectSearchConfig` struct controls scanning behavior:
 
 ```go
 type DirectSearchConfig struct {
-	Connections     uint // Concurrent connections (must be > 0)
-	Step            uint // Message range step size (must be > 0)
-	OverviewTimeout uint // Overview request timeout in seconds (must be > 0)
-	OverviewRetries uint // Number of retries (must be > 0)
+	Connections                uint // Concurrent connections (must be > 0)
+	Step                       uint // MessageScanner range step size (must be > 0)
+	OverviewTimeout            uint // Overview request timeout in seconds (must be > 0)
+	OverviewRetries            uint // Number of retries (must be > 0)
+	BoundariesScannerStep      uint // Overview window size for BoundariesScanner (must be > 0)
+	BoundariesScannerTolerance uint // Date tolerance in seconds for BoundariesScanner (must be > 0)
 }
 ```
 
@@ -153,9 +162,9 @@ Common error scenarios:
 
 - `ErrNoGroupSelected` - A scan was attempted without selecting a group first
 - `ErrGroupHasNoArticles` - The selected group contains no usable articles
-- `ErrInvalidMessageRange` - Message range start >= end
+- `ErrInvalidMessageRange` - Invalid message range (e.g. start/end is 0, or start > end)
 - `ErrInvalidDateRange` - Start date is after end date
 - `ErrNoMessageFoundAfterStartDate` - No messages exist on or after the start date
 - `ErrNoMessageFoundBeforeEndDate` - No messages exist on or before the end date
-- `ErrOldestMessageNewerThanEndDate` - Group's oldest message is newer than search end date
-- `ErrNewestMessageOlderThanStartDate` - Group's newest message is older than search start date
+- `ErrFirstMessageInGroupIsAfterEndDate` - Group's first-message median is after search end date
+- `ErrLastMessageInGroupIsBeforeStartDate` - Group's last-message median is before search start date

@@ -3,6 +3,7 @@ package nntpDirectSearch
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/Tensai75/nntpPool"
 )
@@ -24,15 +25,19 @@ type DirectSearch struct {
 	groupLastArticle               uint
 	boundariesScanner              *boundariesScanner
 	messageScanner                 *messageScanner
+	boundariesScannerRunning       atomic.Bool
+	messageScannerRunning          atomic.Bool
 }
 
 // DirectSearchConfig holds tunable settings for scanning behavior and retry
 // strategies used by DirectSearch.
 type DirectSearchConfig struct {
-	Connections     uint // Number of concurrent connections to use for scanning.
-	Step            uint // Step size for scanning message ranges.
-	OverviewTimeout uint // Timeout in seconds for overview requests.
-	OverviewRetries uint // Number of retries for overview requests.
+	Connections                uint // Number of concurrent connections to use for scanning.
+	Step                       uint // Step size for scanning message ranges.
+	OverviewTimeout            uint // Timeout in seconds for overview requests.
+	OverviewRetries            uint // Number of retries for overview requests.
+	BoundariesScannerStep      uint // Step size for boundaries scanner.
+	BoundariesScannerTolerance uint // Tolerance in seconds for boundaries scanner to consider a date close enough to target.
 }
 
 var (
@@ -42,6 +47,10 @@ var (
 	ErrGroupHasNoArticles = fmt.Errorf("selected group has no articles")
 	// ErrNoGroupSelected indicates a scan was attempted without selecting a group.
 	ErrNoGroupSelected = fmt.Errorf("no group selected")
+	// ErrMessageScannerAlreadyRunning indicates a scan is already running on this DirectSearch instance.
+	ErrMessageScannerAlreadyRunning = fmt.Errorf("message scanner already running")
+	// ErrBoundariesScannerAlreadyRunning indicates a boundaries scan is already running on this DirectSearch instance.
+	ErrBoundariesScannerAlreadyRunning = fmt.Errorf("boundaries scanner already running")
 	// ErrConnectionsMustBeGreaterThanZero indicates an invalid connection count in config.
 	ErrConnectionsMustBeGreaterThanZero = fmt.Errorf("connections must be greater than zero")
 	// ErrStepMustBeGreaterThanZero indicates an invalid step size in config.
@@ -50,6 +59,10 @@ var (
 	ErrOverviewTimeoutMustBeGreaterThanZero = fmt.Errorf("overview timeout must be greater than zero")
 	// ErrOverviewRetriesMustBeGreaterThanZero indicates an invalid overview retry count in config.
 	ErrOverviewRetriesMustBeGreaterThanZero = fmt.Errorf("overview retries must be greater than zero")
+	// ErrBoundariesScannerStepMustBeGreaterThanZero indicates an invalid boundaries scanner step size in config.
+	ErrBoundariesScannerStepMustBeGreaterThanZero = fmt.Errorf("boundaries scanner step must be greater than zero")
+	// ErrBoundariesScannerToleranceMustBeGreaterThanZero indicates an invalid boundaries scanner tolerance in config.
+	ErrBoundariesScannerToleranceMustBeGreaterThanZero = fmt.Errorf("boundaries scanner tolerance must be greater than zero")
 )
 
 // New creates a DirectSearch instance using the provided connection pool and
@@ -75,10 +88,12 @@ func New(pool nntpPool.ConnectionPool, ctx context.Context) (*DirectSearch, erro
 		ctx:       directsearchCtx,
 		ctxCancel: directsearchCtxCancel,
 		config: DirectSearchConfig{
-			Connections:     20,
-			Step:            20000,
-			OverviewTimeout: 5,
-			OverviewRetries: 3,
+			Connections:                20,
+			Step:                       20000,
+			OverviewTimeout:            5,
+			OverviewRetries:            3,
+			BoundariesScannerStep:      1000,
+			BoundariesScannerTolerance: 15,
 		},
 	}, nil
 }
@@ -97,6 +112,12 @@ func (ds *DirectSearch) SetConfig(config DirectSearchConfig) error {
 	}
 	if config.OverviewRetries == 0 {
 		return ErrOverviewRetriesMustBeGreaterThanZero
+	}
+	if config.BoundariesScannerStep == 0 {
+		return ErrBoundariesScannerStepMustBeGreaterThanZero
+	}
+	if config.BoundariesScannerTolerance == 0 {
+		return ErrBoundariesScannerToleranceMustBeGreaterThanZero
 	}
 	ds.config = config
 	return nil
