@@ -396,10 +396,9 @@ func (ds *DirectSearch) findMessageByDate(searchForFirst bool) boundariesScanner
 			}
 		}
 
-		// Check if the mean date is close enough to the target date to return result
-		if (search.forFirst && (search.targetDate.Before(meanDate) && search.targetDate.After(meanDate.Add(-time.Duration(ds.config.BoundariesScannerTolerance)*time.Second)))) ||
-			(!search.forFirst && (search.targetDate.After(meanDate) && search.targetDate.Before(meanDate.Add(time.Duration(ds.config.BoundariesScannerTolerance)*time.Second)))) {
-			ds.log(fmt.Sprintf("Target date %s is close to mean date %s for %s message search, returning result", search.targetDate.Format(time.RFC850), meanDate.Format(time.RFC850), search.target))
+		// Check if the mean date matches or is close enough to the target date to return result
+		if withinBoundaryTolerance(search.forFirst, search.targetDate, meanDate, ds.config.BoundariesScannerTolerance) {
+			ds.log(fmt.Sprintf("Target date %s matches or is close to mean date %s for %s message search, returning result", search.targetDate.Format(time.RFC850), meanDate.Format(time.RFC850), search.target))
 			if search.forFirst {
 				return boundariesScannerResult{uint(firstResult.MessageNumber), meanDate, nil}
 			} else {

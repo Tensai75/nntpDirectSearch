@@ -101,6 +101,23 @@ func TimeMedian(times []time.Time) time.Time {
 	return time.Unix(0, (low+high)/2).UTC()
 }
 
+// withinBoundaryTolerance reports whether the target time matches the median
+// exactly or lies within the configured tolerance on the expected side.
+func withinBoundaryTolerance(forFirst bool, targetDate, meanDate time.Time, toleranceSeconds uint) bool {
+	if targetDate.Equal(meanDate) {
+		return true
+	}
+
+	tolerance := time.Duration(toleranceSeconds) * time.Second
+	if forFirst {
+		lowerBound := meanDate.Add(-tolerance)
+		return targetDate.Before(meanDate) && (targetDate.After(lowerBound) || targetDate.Equal(lowerBound))
+	}
+
+	upperBound := meanDate.Add(tolerance)
+	return targetDate.After(meanDate) && (targetDate.Before(upperBound) || targetDate.Equal(upperBound))
+}
+
 // stopAndDrainTimer safely stops a timer and drains its channel to prevent leaks.
 func stopAndDrainTimer(timer *time.Timer) {
 	if timer == nil {
