@@ -1,6 +1,7 @@
 package nntpDirectSearch
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -66,4 +67,33 @@ func TestWithinBoundaryTolerance(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMaybeRestartOverviewScannerDoesNotBlockWhenLimiterIsFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ds := &DirectSearch{
+		messageScanner: &messageScanner{
+			ctx:                    ctx,
+			overviewScannerLimiter: make(chan struct{}, 1),
+		},
+	}
+
+	ds.messageScanner.overviewScannerLimiter <- struct{}{}
+
+	returned := make(chan struct{})
+	go func() {
+		ds.maybeRestartOverviewScanner(1, 100, 200, 0)
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("maybeRestartOverviewScanner blocked while the limiter was full")
+	}
+
+	cancel()
+	ds.messageScanner.overviewScannerWG.Wait()
 }

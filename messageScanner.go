@@ -301,20 +301,24 @@ func (ds *DirectSearch) maybeRestartOverviewScanner(lineNumber, first, last, res
 	} else {
 		restart++
 	}
-	select {
-	case <-ds.messageScanner.ctx.Done():
-		return
-	case ds.messageScanner.overviewScannerLimiter <- struct{}{}:
-		f := first + lineNumber - 1
-		l := last
-		r := restart
-		ds.log(fmt.Sprintf("Restarting overview reader for range %d - %d", f, l))
-		ds.messageScanner.overviewScannerWG.Go(func() {
-			defer func() { <-ds.messageScanner.overviewScannerLimiter }()
-			ds.overviewScanner(f, l, r)
-		})
-	}
 
+	f := first + lineNumber - 1
+	l := last
+	r := restart
+	ds.log(fmt.Sprintf("Restarting overview reader for range %d - %d", f, l))
+
+	// Schedule the restart asynchronously. If every active overview reader times
+	// out at once, each caller is still holding its limiter slot until return.
+	// Trying to acquire a new slot synchronously here deadlocks the whole scan.
+	ds.messageScanner.overviewScannerWG.Go(func() {
+		select {
+		case <-ds.messageScanner.ctx.Done():
+			return
+		case ds.messageScanner.overviewScannerLimiter <- struct{}{}:
+		}
+		defer func() { <-ds.messageScanner.overviewScannerLimiter }()
+		ds.overviewScanner(f, l, r)
+	})
 }
 
 // lineScanner parses overview lines into NZB structures.
